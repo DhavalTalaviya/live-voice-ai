@@ -1,0 +1,6 @@
+fastapi            
+uvicorn[standard]  
+# webrtcvad        (Loaded Manually)
+httpx              
+vosk
+ollama

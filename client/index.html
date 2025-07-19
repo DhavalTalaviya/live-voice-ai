@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>LiveVoiceAI Demo</title>
+  <style>
+    body {
+      font-family: sans-serif;
+      padding: 1rem;
+      max-width: 600px;
+      margin: auto;
+    }
+    h1 {
+      text-align: center;
+    }
+    .controls {
+      text-align: center;
+      margin-bottom: 1rem;
+    }
+    button {
+      margin: 0 .5rem;
+      padding: .5rem 1rem;
+      font-size: 1rem;
+    }
+    #transcriptArea {
+      border: 1px solid #ccc;
+      border-radius: 8px;
+      padding: 1rem;
+      min-height: 200px;
+      background: #fafafa;
+    }
+    .bubble {
+      display: inline-block;
+      background: #007bff;
+      color: white;
+      padding: .5rem 1rem;
+      margin: .25rem 0;
+      border-radius: 16px;
+      max-width: 80%;
+      word-wrap: break-word;
+    }
+    .bubble.self {
+      background: #28a745;
+      float: right;
+    }
+    .timestamp {
+      font-size: .75rem;
+      color: #666;
+      margin: .2rem .5rem;
+    }
+    .clearfix::after {
+      content: "";
+      display: table;
+      clear: both;
+    }
+  </style>
+</head>
+<body>
+  <h1>LiveVoiceAI Demo</h1>
+  <div class="controls">
+    <button id="startBtn">Start</button>
+    <button id="stopBtn" disabled>Stop</button>
+    <button id="downloadBtn" disabled>Download Transcript</button>
+  </div>
+  <div id="transcriptArea"></div>
+
+  <script>
+    let inAssistantTurn       = false;
+    let currentAssistantBubble = null;
+    let resetTimeout          = null;
+
+    let ttsBuffer  = "";
+    let ttsTimeout = null;
+    let speaking = false;
+    
+    let ttsVoice = null;
+
+    const startBtn = document.getElementById('startBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const downloadBtn = document.getElementById('downloadBtn');
+    const transcriptArea = document.getElementById('transcriptArea');
+
+    let audioCtx, source, processor, ws, micStream;
+    const transcripts = [];
+
+    startBtn.onclick = () => {
+      startBtn.disabled = true;
+      stopBtn.disabled = false;
+      downloadBtn.disabled = true;
+      initStream();
+    };
+
+    stopBtn.onclick = () => {
+      stopBtn.disabled = true;
+      startBtn.disabled = false;
+      downloadBtn.disabled = transcripts.length === 0;
+      teardown();
+    };
+
+    downloadBtn.onclick = () => {
+      const blob = new Blob([ transcripts.join('\n') ], { type: 'text/plain' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'transcript.txt';
+      a.click();
+      URL.revokeObjectURL(url);
+    };
+
+    function initStream() {
+      // open WebSocket
+      ws = new WebSocket(`ws://${location.host}/ws`);
+      ws.binaryType = 'arraybuffer';
+      ws.onopen = () => addSystemMessage('WebSocket opened');
+      ws.onmessage = evt => handleServerMessage(evt.data);
+      ws.onclose = () => addSystemMessage('WebSocket closed');
+      ws.onerror = err => addSystemMessage('WebSocket error: ' + err);
+
+      // capture mic
+      navigator.mediaDevices.getUserMedia({ audio: true })
+        .then(stream => {
+          micStream = stream;
+          audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+          source = audioCtx.createMediaStreamSource(stream);
+          processor = audioCtx.createScriptProcessor(4096, 1, 1);
+          source.connect(processor);
+          processor.connect(audioCtx.destination);
+          processor.onaudioprocess = onAudioProcess;
+        })
+        .catch(err => {
+          addSystemMessage('Mic error: ' + err);
+          teardown();
+        });
+    }
+
+    function teardown() {
+      if (processor) {
+        processor.disconnect();
+        processor.onaudioprocess = null;
+      }
+      if (source) source.disconnect();
+      if (audioCtx) audioCtx.close();
+      if (micStream) micStream.getTracks().forEach(t => t.stop());
+      if (ws && ws.readyState === WebSocket.OPEN) ws.close();
+    }
+
+    function onAudioProcess(e) {
+        if (speaking) {
+            // drop everything while AI is talking
+            return;
+        }
+        const float32 = downsampleBuffer(e.inputBuffer.getChannelData(0), audioCtx.sampleRate, 16000);
+        const pcm16 = floatTo16BitPCM(float32);
+        if (ws.readyState === WebSocket.OPEN) ws.send(pcm16);
+    }
+
+    
+    function initVoice() {
+        const voices = window.speechSynthesis.getVoices();
+        if (voices.length) {
+            // pick your preferred voice, or fall back to the first
+            ttsVoice = voices.find(v => v.name.includes("Google US English")) || voices[0];
+        }
+    }
+
+    window.speechSynthesis.onvoiceschanged = () => {
+        initVoice();
+    };
+
+    initVoice();
+
+    function handleServerMessage(msg) {
+        const time = new Date().toLocaleTimeString();
+
+        if (!inAssistantTurn) {
+            // ─── user utterance ───
+            addBubble(msg, time, false);
+            inAssistantTurn       = true;
+            currentAssistantBubble = null;
+            return;
+
+        } 
+        
+        // ─── assistant streaming ───
+        if (!currentAssistantBubble) {
+            // first token of assistant’s reply
+            currentAssistantBubble = addBubble(msg, time, true);
+         } else {
+            // append to the same bubble
+            currentAssistantBubble.textContent += msg;
+        }
+
+        // —— accumulate for TTS —— 
+        ttsBuffer += msg;
+
+        // clear any pending speak call
+        clearTimeout(ttsTimeout);
+
+        // if sentence-ending punctuation, speak immediately
+        if (/[.?!]\s*$/.test(ttsBuffer)) {
+            speakBuffer();
+        } else {
+            // otherwise wait 500ms of silence before speaking
+            ttsTimeout = setTimeout(speakBuffer, 500);
+        }
+
+        // clear any pending “turn‑end” timer
+        clearTimeout(resetTimeout);
+
+        // schedule a reset after 600 ms of no messages
+        resetTimeout = setTimeout(() => {
+            inAssistantTurn       = false;
+            currentAssistantBubble = null;
+        }, 1000);
+
+    }
+
+    function addBubble(text, time, isAssistant) {
+      const container = document.createElement('div');
+      container.className = 'clearfix';
+      const bubble = document.createElement('div');
+      bubble.className = 'bubble ' + (isAssistant ? '' : 'self');
+      bubble.textContent = text;
+      const ts = document.createElement('div');
+      ts.className = 'timestamp';
+      ts.textContent = time;
+      container.append(bubble, ts);
+      transcriptArea.append(container);
+      transcriptArea.scrollTop = transcriptArea.scrollHeight;
+      return bubble;
+    }
+
+    function speakBuffer() {
+        if (!ttsBuffer) return;
+        // cancel any ongoing speech so we don’t overlap
+        window.speechSynthesis.cancel();
+
+        const utter = new SpeechSynthesisUtterance(ttsBuffer);
+
+        if (ttsVoice) {
+            utter.voice = ttsVoice;
+        }
+        utter.rate = 1.2;
+
+        utter.onstart = () => {
+            speaking = true;
+        };
+        utter.onend = () => {
+            speaking = false;
+        };
+        window.speechSynthesis.speak(utter);
+
+        // clear for next batch
+        ttsBuffer = "";
+    }
+
+    function addSystemMessage(text) {
+      const msg = document.createElement('div');
+      msg.style.color = '#888';
+      msg.style.fontStyle = 'italic';
+      msg.textContent = text;
+      transcriptArea.appendChild(msg);
+      transcriptArea.scrollTop = transcriptArea.scrollHeight;
+    }
+
+    // —— helpers from before —— 
+
+    function downsampleBuffer(buffer, srcRate, dstRate) {
+      if (dstRate === srcRate) return buffer;
+      const ratio = srcRate / dstRate;
+      const newLen = Math.round(buffer.length / ratio);
+      const out = new Float32Array(newLen);
+      let offsetIn = 0, offsetOut = 0;
+      while (offsetOut < newLen) {
+        const nextOffsetIn = Math.round((offsetOut + 1) * ratio);
+        let sum = 0, count = 0;
+        for (let i = offsetIn; i < nextOffsetIn && i < buffer.length; i++) {
+          sum += buffer[i];
+          count++;
+        }
+        out[offsetOut] = count > 0 ? sum / count : 0;
+        offsetOut++;
+        offsetIn = nextOffsetIn;
+      }
+      return out;
+    }
+
+    function floatTo16BitPCM(input) {
+      const buf = new ArrayBuffer(input.length * 2);
+      const view = new DataView(buf);
+      for (let i = 0; i < input.length; i++) {
+        let s = Math.max(-1, Math.min(1, input[i]));
+        view.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+      }
+      return buf;
+    }
+  </script>
+</body>
+</html>
