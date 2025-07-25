@@ -12,13 +12,13 @@ app = FastAPI(
     version="0.4.0"
 )
 
-# 1) Load Vosk model once
+# load Vosk model once
 SAMPLE_RATE = 16000
 vosk_model = Model("model/vosk-model-small-en-us-0.15")
 recognizer = KaldiRecognizer(vosk_model, SAMPLE_RATE)
 recognizer.SetWords(True)
 
-# 2) VAD (aggressiveness: 0–3)
+# VAD (aggressiveness: 0–3)
 vad = webrtcvad.Vad(2)
 
 # ————— Ollama client —————
@@ -68,7 +68,7 @@ async def process_audio_stream(ws: WebSocket):
                         if text:
                             await ws.send_text(text)
 
-                            # Generate an assistant reply via llama3
+                            # generate an assistant reply via llama3
                             resp = await ollama_client.chat(
                                 model="llama3", 
                                 messages=[{"role": "user", "content": text}],
@@ -95,7 +95,7 @@ async def process_audio_stream(ws: WebSocket):
 async def websocket_endpoint(ws: WebSocket):
     await process_audio_stream(ws)
 
-# 1) Serve client files
+# serve client files
 app.mount("/", StaticFiles(directory="client", html=True), name="client")
 
 
