@@ -25,7 +25,7 @@ A fully-offline, real-time voice assistant showcasing:
 ## Installation
 
 ```bash
-git clone https://github.com/<your-username>/livevoiceai.git
+git clone https://github.com/DhavalTalaviya/livevoiceai.git
 pip install -r requirements.txt
 ```
 
